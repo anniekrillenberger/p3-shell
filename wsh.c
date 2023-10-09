@@ -18,6 +18,8 @@ typedef struct Job {
     int numArgs;	// length of args
     int wasInitBG;	// if the job was initiated as bg (with an &)
     int isValid;	// 0 if space in use, 1 otherwise
+    pid_t pid;		// 
+    pid_t pgid;		// 
 } Job;
 
 // pipeline of processes
@@ -27,13 +29,52 @@ typedef struct JobGroup {
 } JobGroup;
 
 // GLOBAL VARIABLES //
-
-struct Job allJobs[256]; // array of jobs 
+struct Job allJobs[256]; // array of background & stopped jobs 
 Job foregroundJob;
 pid_t shellPGID;
 struct termios shellTmodes;
 int shellTerminal;
 int isShellInteractive;
+
+
+// add job to array - ID, isDone, isFG, programName, args, numArgs, & wasInitB
+Job addJob(char **args, pid_t pid) {
+    struct Job newJob;
+    newJob.isDone = 0;
+    newJob.wasInitBG = 0;
+    newJob.numArgs = 0;
+    newJob.programName = args[0];
+    newJob.pid = pid;
+	
+    for(int j = 0; j < 256; j++) { // find ID
+	if(allJobs[j].isValid == 1) {
+	    newJob.isValid = 0;
+   	    allJobs[j] = newJob;
+	    newJob.id = j + 1; // ID has to be positive
+	    break;
+	}
+    }
+
+    int i = 1;
+    while(args[i] != NULL) { // get wasInitBG, args, & numArgs
+	if(strcmp(args[i], "&") == 0) {
+	    newJob.wasInitBG = 1;
+	    newJob.isFG = 0;
+	    break; // means we're at the end of args
+	}
+	    
+	newJob.args[newJob.numArgs] = args[i];
+        newJob.numArgs++;    
+        i++;
+     }
+     
+     if(!newJob.wasInitBG) {
+         newJob.isFG = 1;
+    	 foregroundJob = newJob;
+     }
+     
+     return newJob;
+}
 
 
 // code from GNU C Library
@@ -82,8 +123,7 @@ void shellInit() {
 
 
 // code from GNU C Library
-// TODO: add in piping
-void launchJob(Job *job) {
+void launchJob(Job job, pid_t pgid, char **args, int fg, int wshc, char path[]) {
     pid_t pid;
     
     if(isShellInteractive) {
@@ -91,10 +131,19 @@ void launchJob(Job *job) {
         pid = getpid();
         if(pid == 0) {
             pgid = pid;
+            job.pgid = pgid;
         }
-        if(job -> isFG) {
-            tcset(shellTerminal, pgid);
-        }
+        
+        setpgid(pid, pgid);
+        
+        // if job is foreground
+        if(fg) {
+            tcsetpgrp(shellTerminal, pgid);
+        } 
+        
+        if (strcmp(args[wshc - 1], "&") == 0) {
+	    args[wshc - 1] = NULL;
+	}
         
         // Set the handling for job control signals back to the default
         signal (SIGINT,  SIG_DFL);
@@ -103,12 +152,19 @@ void launchJob(Job *job) {
         signal (SIGTTIN, SIG_DFL);
         signal (SIGTTOU, SIG_DFL);
         signal (SIGCHLD, SIG_DFL);
+        
+        execvp(path, args);
+        
+        // if succeeds, should not reach here !!
+        char execFailed[256] = "Exec failed\n";
+        write(STDOUT_FILENO, execFailed, strlen(execFailed));
+        exit(-1);
     }
 }
 
 
 // implement commands specified by paths
-int paths(char **args, int wshc) {
+void paths(char **args, int wshc) {
     char pathUsr[256] = "/usr/bin/";
     char path[256] = "/bin/";
     char absolutePath[256] = "";
@@ -127,56 +183,39 @@ int paths(char **args, int wshc) {
         strcpy(absolutePath, pathUsr);
     }
     
-    // fork exec !!! -- reference from discussion code
+    // check if initialized to background
+    int fg = 1;
+    if(strcmp(args[wshc - 1], "&") == 0) {
+        fg = 0;
+    }
+    
     pid_t pid = fork();
-    if (pid == 0) { // child process !!
+    struct Job job; 
+    if(!fg) {
+        job = addJob(args, pid);
+    }
     
-        launchJob();
-    
-        execvp(absolutePath, args);
-        // if succeeds, should not reach here !!
-        char execFailed[256] = "Exec failed\n";
-        write(STDOUT_FILENO, execFailed, strlen(execFailed));
-        exit(-1);
+    // fork exec !!! -- reference from discussion code
+    if (pid == 0) { // child process !!  
+ 	pid_t pgid = 0;
+ 	
+        launchJob(job, pgid, args, fg, wshc, absolutePath);
+        
     } else { // parent process !!
-
-        // add job to array - ID, isDone, isFG, programName, args, numArgs, & wasInitBG
-        struct Job newJob;
-	newJob.isDone = 0;
-	newJob.wasInitBG = 0;
-	newJob.numArgs = 0;
-	newJob.programName = args[0];
-	newJob.isFG = 1;
-	foregroundJob = newJob;
-	
-    	for(int j = 0; j < 256; j++) { // find ID
-            if(allJobs[j].isValid == 1) {
-            	newJob.isValid = 0;
-            	allJobs[j] = newJob;
-                newJob.id = j + 1; // ID has to be positive
-                break;
+        if(isShellInteractive) {
+            if(!job.pgid) {
+                job.pgid = pid;
             }
-	}
-	
-	int i = 1;
-	while(args[i] != NULL) { // get wasInitBG, args, & numArgs
-	
-	    if(strcmp(args[i], "&") == 0) {
-	         newJob.wasInitBG = 1;
-	         break; // means we're at the end of args
-	    }
-	    
-	    newJob.args[newJob.numArgs] = args[i];
-	    newJob.numArgs++;    
-	    i++;
-	}
+            setpgid(pid, job.pgid);
+        }
 		
         int status;
         waitpid(pid, &status, 0); // wait for child process to finish
-        
-        return 1;
     }
 }
+
+
+// ** BUILT IN COMMANDS ** //
 
 
 /**
@@ -209,7 +248,7 @@ int jobs(char **args, int wshc) {
         if (wshc != 1) { // error! -- 1 arg is jobs
             char argError[256] = "the jobs command has no arguments\n";
             write(STDOUT_FILENO, argError, strlen(argError));
-            exit(-1);
+            return -1;
         }
         // TODO: account for piping when implemented
         // iterate through jobs & print out background jobs
@@ -229,9 +268,9 @@ int jobs(char **args, int wshc) {
                     char initBG[256] = " &";
                     write(STDOUT_FILENO, initBG, strlen(initBG));
                 }
-                char *newLine = "\n";
-                write(STDOUT_FILENO, newLine, strlen(newLine));
             } // else the job is in the foreground !
+            char *newLine = "\n";
+            write(STDOUT_FILENO, newLine, strlen(newLine));
         }
         return 1;
     }
@@ -254,7 +293,7 @@ int exitAndCD(char **args, int wshc) {
         if (wshc != 2) { // error! -- account for cd arg
             char argError[256] = "Incorrect number of arguments for cd\n";
             write(STDOUT_FILENO, argError, strlen(argError));
-            exit(-1);
+            return -1;
         }
         // system call with file path given by user
         chdir(args[1]);
@@ -305,7 +344,7 @@ int main(int argc, char *argv[]) {
     } else { // invalid input
         char invalidIn[256] = "Invalid input\n";
         write(STDOUT_FILENO, invalidIn, strlen(invalidIn));
-        exit(-1);
+        return -1;
     }
 
     while (1) { // repeatedly asks for input
@@ -346,10 +385,7 @@ int main(int argc, char *argv[]) {
         if (builtInCommands(args, wshc)) continue;
 
         // paths
-        if(paths(args, wshc)) continue;
-        
-        char notHere[256] = "You should not be here!!";
-        write(STDOUT_FILENO, notHere, strlen(notHere));
+        paths(args, wshc);
 
     } // end of while loop
 
