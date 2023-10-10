@@ -6,7 +6,7 @@
 #include <sys/types.h>
 #include <termios.h>
 #include <fcntl.h>
-
+#include <signal.h>
 
 // job code / logic from GNU C Library //
 
@@ -25,7 +25,7 @@ typedef struct Job {
 
 // pipeline of processes
 typedef struct JobGroup {
-    pid_t pgid;			// job group ID
+    pid_t pgid;			    // job group ID
     struct termios tmodes;	// saved terminal modes
 } JobGroup;
 
@@ -39,9 +39,14 @@ int isShellInteractive;
 volatile sig_atomic_t sigChildFlag = 0;
 
 
+// Handle SIGCHLD (child process dies)
 void sigchild_handler(int sigchild) {
     sigChildFlag = 1;
-}
+    
+    int status;
+    // block until background process is done
+    waitpid(WAIT_ANY, &status, WUNTRACED|WNOHANG); // PUT IN WHILE LOOP !!
+} // gets called for any changed -- use status to find out!!
 
 
 // add job to array - ID, isDone, isFG, programName, args, numArgs, & wasInitB
@@ -61,8 +66,8 @@ Job addJob(char **args, int wshc, pid_t pid) {
      }
      
      if(strcmp(args[wshc - 1], "&") == 0) { // wasInitGB & isFG
-          newJob.wasInitBG = 1;
-	  newJob.isFG = 0;
+        newJob.wasInitBG = 1;
+	    newJob.isFG = 0;
      }
      
      if(!newJob.wasInitBG) { // forground process
@@ -70,61 +75,16 @@ Job addJob(char **args, int wshc, pid_t pid) {
     	 foregroundJob = newJob;
      } else {
          for(int j = 0; j < 256; j++) { // find ID
-	     if(allJobs[j].isValid == 1) {
-	         newJob.isValid = 0;
-	         newJob.id = 1 + j; // ID has to be positive
-   	         allJobs[j] = newJob;
-	         break;
-	    }
+            if(allJobs[j].isValid == 1) {
+                newJob.isValid = 0;
+                newJob.id = 1 + j; // ID has to be positive
+                allJobs[j] = newJob;
+                break;
+            }
         }
      }
      
      return newJob;
-}
-
-
-// code from GNU C Library
-void shellInit() {
-    // get process group ID of current terminal 
-    pid_t initpgid = tcgetpgrp(STDIN_FILENO);
-    if(initpgid == -1) {
-        char pgidErr[256] = "Error getting current terminal process ID\n";
-        write(STDOUT_FILENO, pgidErr, strlen(pgidErr));
-        exit(-1);
-    }
-    
-    // TODO: check if running interactively when implementing batch mode
-    // Make sure the shell is running interactively as the foreground job
-    shellTerminal = STDIN_FILENO;
-    isShellInteractive = isatty(shellTerminal);
-    if(isShellInteractive) {
-        // loop until in foreground
-        while(tcgetpgrp(shellTerminal) != (shellPGID = getpgrp()))
-            kill (- shellPGID, SIGTTIN);
-            
-        // Ignore interactive and job-control signals
-    	signal (SIGINT,  SIG_IGN);
-	signal (SIGQUIT, SIG_IGN);
-	signal (SIGTSTP, SIG_IGN);
-	signal (SIGTTIN, SIG_IGN);
-	signal (SIGTTOU, SIG_IGN);
-	signal (SIGCHLD, SIG_IGN);
-	
-	// Put ourselves in our own process group 
-        shellPGID = getpid();
-      	if (setpgid (shellPGID, shellPGID) < 0) {
-      	    char processGroupErr[256] = "Couldn't put the shell in its own process group\n";
-      	    write(STDOUT_FILENO, processGroupErr, strlen(processGroupErr));
-            exit(-1);
-        }
-        
-        // Grab control of the terminal
-      	tcsetpgrp (shellTerminal, shellPGID);
-
-      	// Save default terminal attributes for shell
-      	tcgetattr (shellTerminal, &shellTmodes);
-      
-    } // end of isShellInteractive
 }
 
 
@@ -153,8 +113,9 @@ void launchJob(Job job, pid_t pgid, char **args, int fg, int wshc, char path[]) 
         signal (SIGQUIT, SIG_DFL);
         signal (SIGTSTP, SIG_DFL);
         signal (SIGTTIN, SIG_DFL);
-        // signal (SIGTTOU, SIG_DFL);
+        // signal (SIGTTOU, SIG_DFL); -- SHOULD NOT MAKE PROBLEM
         signal (SIGCHLD, SIG_DFL);
+        signal (SIGCONT, SIG_DFL);
     }
         
     execvp(path, args);
@@ -166,11 +127,51 @@ void launchJob(Job job, pid_t pgid, char **args, int fg, int wshc, char path[]) 
 }
 
 
+/* Put a job in the background.  If the cont argument is true, send
+ * the process group a SIGCONT signal to wake it up.  
+ */
+void putInBG(Job job, int cont) {
+    // send the job a continue signal if necessary
+    if(cont) {
+        if(kill (-job.pgid, SIGCONT) < 0) {
+            char killFailed[256] = "kill SIGCONT error (BG)\n";
+    	    write(STDOUT_FILENO, killFailed, strlen(killFailed));
+        }
+    } else {
+        // Set the process group to be in the background
+        if (tcsetpgrp(shellTerminal, shellPGID) < 0) {
+            char tcsetpgrp[256] = "tcsetpgrp (putInBG)\n";
+    	    write(STDOUT_FILENO, tcsetpgrp, strlen(tcsetpgrp));
+        }
+    }
+
+    // Ignore SIGINT and SIGTSTP
+    signal(SIGINT, SIG_IGN);
+    signal(SIGTSTP, SIG_IGN);
+}
+
+
+// Handle SIGTSTP (Ctrl-Z)
+void sigtstp_handler(int signo) { // dont need to handle !! ignore in shell, child set to default
+// update job in sigchild -- call waitpid in while loop
+    // suspends foreground job & put job in BG
+    putInBG(foregroundJob, 0); // DEFINIETELY SHOULD NOT BE DOING THIS
+    // make fg job available to be open again
+    foregroundJob.isValid = 1;
+    // set back to default
+    signal(SIGTSTP, SIG_DFL);
+    kill (- foregroundJob.pid, SIGTSTP);
+    printf("SIGSTP\n");
+    // NOT CALLED WHEN CTRL-Z
+}
+
+
 /** Put job in the foreground.  If cont is nonzero,
   * restore the saved terminal modes and send the process group a
   * SIGCONT signal to wake it up before we block.  
 */
 void putInFG(Job job, int cont) {
+    foregroundJob = job;
     // Put the job into the foreground
     tcsetpgrp (shellTerminal, job.pgid);
 
@@ -182,24 +183,74 @@ void putInFG(Job job, int cont) {
     	  write(STDOUT_FILENO, killFailed, strlen(killFailed));
       }
     }
-    
+
     int status;
     waitpid(job.pid, &status, WUNTRACED);
+
+    // 
+
+    // Restore signal handling -- DONT DO THIS, NOTHING TO DO W CHILD
+    // signal(SIGTSTP, sigtstp_handler);
+
+    // Check if the job was stopped by SIGTSTP
+    if (WIFSTOPPED(status)) {
+        printf("Job [%d] stopped by signal SIGTSTP\n", job.id);
+        // PUT IN JOB LIST !! GET RID OF SIGTSTOP Handler 
+    }
+
+    // clear fg
+    // check status of fg -- compare against WIFSTOPPED (ish) 
     
-    tcsetpgrp(shellTerminal, shellPGID);
+    tcsetpgrp(shellTerminal, shellPGID); // CORRECT 
+    // IF TERMINATED LET GO !! DONT NEED ! DONT NEED TO DO
 }
 
-/* Put a job in the background.  If the cont argument is true, send
- * the process group a SIGCONT signal to wake it up.  
- */
-void putInBG(Job job, int cont) {
-    // send the job a continue signal if necessary
-    if(cont) {
-        if(kill (-job.pgid, SIGCONT) < 0) {
-            char killFailed[256] = "kill SIGCONT error (BG)\n";
-    	    write(STDOUT_FILENO, killFailed, strlen(killFailed));
-        }
+
+// code from GNU C Library
+void shellInit() {
+    // get process group ID of current terminal 
+    pid_t initpgid = tcgetpgrp(STDIN_FILENO);
+    if(initpgid == -1) {
+        char pgidErr[256] = "Error getting current terminal process ID\n";
+        write(STDOUT_FILENO, pgidErr, strlen(pgidErr));
+        exit(-1);
     }
+    
+    // TODO: check if running interactively when implementing batch mode
+    // Make sure the shell is running interactively as the foreground job
+    shellTerminal = STDIN_FILENO;
+    isShellInteractive = isatty(shellTerminal);
+    if(isShellInteractive) {
+        // loop until in foreground
+        while(tcgetpgrp(shellTerminal) != (shellPGID = getpgrp()))
+            kill (- shellPGID, SIGTTIN);
+            
+        // Ignore interactive and job-control signals
+    	signal (SIGINT,  SIG_IGN);
+        signal (SIGQUIT, SIG_IGN);
+        signal (SIGTSTP, sigtstp_handler);
+        signal (SIGTTIN, SIG_IGN);
+        signal (SIGTTOU, SIG_IGN);
+        signal (SIGCHLD, SIG_IGN);
+        
+        // Put ourselves in our own process group -- from piazza
+        shellPGID = getpid();
+        if(getpid() != getsid(0)) {
+            // the shell is not the session leader :)
+            if (setpgid (shellPGID, shellPGID) < 0) {
+                char processGroupErr[256] = "Couldn't put the shell in its own process group\n";
+                write(STDOUT_FILENO, processGroupErr, strlen(processGroupErr));
+                exit(-1);
+            }
+        }
+        
+        // Grab control of the terminal
+      	tcsetpgrp (shellTerminal, shellPGID);
+
+      	// Save default terminal attributes for shell
+      	tcgetattr (shellTerminal, &shellTmodes);
+      
+    } // end of isShellInteractive
 }
 
 
@@ -226,7 +277,7 @@ int paths(char **args, int wshc) {
     
     pid_t pid = fork();
     struct Job job; 
-    job = addJob(args, wshc, pid);
+    job = addJob(args, wshc, pid); // ONLY PARENTS SHOULD HAVE ACCESS TO THIS
     
     int fg = 1; // default to foreground
     // check if initialized to background
@@ -238,7 +289,7 @@ int paths(char **args, int wshc) {
     // fork exec !!! -- reference from discussion code
     if (pid == 0) { // child process !! 
     	job.pid = getpid();
- 	pid_t pgid = 0;
+ 	    pid_t pgid = 0;
  	
         launchJob(job, pgid, args, fg, wshc, absolutePath);
         
@@ -251,26 +302,28 @@ int paths(char **args, int wshc) {
             
             if(fg) { // job in foreground
                 putInFG(job, 0);
+                foregroundJob = job;
             } else {
                 // wait pid for sigchild -- different waitpid
-                // remove job from job list & autoremoves from ps
-        	signal(SIGCHLD, sigchild_handler);
+        	    signal(SIGCHLD, sigchild_handler);
                 putInBG(job, 0);
-                
-                int status;
-    		// block until background process is done
-	        pid_t bgPID = waitpid(pid, &status, WUNTRACED|WNOHANG); // TODO: move this, won't work in every case
-	        if(bgPID == -1) {
-		    char waitPIDErr[256] = "SIGCHLD waitpid error\n";
-		    write(STDOUT_FILENO, waitPIDErr, strlen(waitPIDErr));
-		    exit(-1);
-	        }
             }
         } // end of if(isShellInteractive) 
+        
+        // remove job from job list & autoremoves from ps
         if(sigChildFlag) { // get rid of inactive background job
             for (int j = 0; j < 256; j++) {
                 if (!allJobs[j].isFG && !allJobs[j].isValid) {
+                    // Send SIGCONT to the process group associated with the job
+                    if (kill(-allJobs[j].pgid, SIGCONT) < 0) {
+                        char kill[256] = "kill (removing job)\n";
+                        write(STDOUT_FILENO, kill, strlen(kill));
+                        return -1;
+                    }
+
+                    // Clear the job entry
                     allJobs[j].isValid = 1;
+                    allJobs[j].id = 0;
                 }
             }
         }
@@ -283,24 +336,136 @@ int paths(char **args, int wshc) {
 
 
 /**
- * checks built in command bg
+ * resume a stopped background job
+ * release SINGCONT and update job list
  *
  * returns 1 if command completed, 0 otherwise
  */
-int bg() {
-    return 0;
+int bg(char **args, int wshc) {
+    // check if user started with bg
+    if (strncmp(args[0], "bg", 2) != 0) return 0;
+
+    if (wshc != 1 && wshc != 2) { // bg has no or one arg
+        char argError[256] = "the bg command has no or 1 argument(s)\n";
+        write(STDOUT_FILENO, argError, strlen(argError));
+        return -1;
+    } 
+
+    int jobID;
+    if(wshc == 2) {
+        jobID = atoi(args[1]);
+        if(!jobID) {
+            char numError[256] = "Argument for bg must be a number\n";
+            write(STDOUT_FILENO, numError, strlen(numError));
+            return -1;
+        }
+    } else { // Determine the largest job ID
+        jobID = -1;
+        for(int i=0; i<256; i++) {
+        	if(!allJobs[i].isValid && allJobs[i].id > jobID && !allJobs[i].isFG) {
+                jobID = allJobs[i].id;
+            }
+        }
+        if (jobID == -1) {
+            char noJobsError[256] = "No jobs available in bg\n";
+            write(STDOUT_FILENO, noJobsError, strlen(noJobsError));
+            return -1;
+        }
+    }
+
+    // Find the job with the specified ID
+    int found = 0;
+    for (int i = 0; i < 256; i++) {
+        if (!allJobs[i].isValid && !allJobs[i].isFG && allJobs[i].id == jobID) {
+            // Send SIGCONT to the process group associated with the job
+            if (kill(-allJobs[i].pgid, SIGCONT) < 0) {
+                char kill[256] = "kill\n";
+                write(STDOUT_FILENO, kill, strlen(kill));
+                return -1;
+            }
+
+            // Update job status
+            allJobs[i].isDone = 0;
+
+            char resumeMsg[256];
+            sprintf(resumeMsg, "Resumed background job with ID %d\n", jobID);
+            write(STDOUT_FILENO, resumeMsg, strlen(resumeMsg));
+
+            found = 1;
+            break;
+        }
+    }
+
+    if (!found) {
+        char notFoundMsg[256];
+        sprintf(notFoundMsg, "No background job found with ID %d\n", jobID);
+        write(STDOUT_FILENO, notFoundMsg, strlen(notFoundMsg));
+        return -1;
+    }
+
+    return 1;
 }
 
 
 /**
- * checks built in command fg
+ * moves a job that is stopped or running in bg to the fg
  *
  * returns 1 if command completed, 0 otherwise
  */
-int fg() {
+int fg(char **args, int wshc) {
+    // check if user started with bg
+    if (strncmp(args[0], "fg", 2) != 0) return 0;
 
-    
-    return 0;
+    if (wshc != 1 && wshc != 2) { // fg has no or one arg
+        char argError[256] = "the fg command has no or 1 argument(s)\n";
+        write(STDOUT_FILENO, argError, strlen(argError));
+        return -1;
+    }
+
+    int jobID;
+    if(wshc == 2) {
+        jobID = atoi(args[1]);
+        if(!jobID) {
+            char numError[256] = "Argument for fg must be a number\n";
+            write(STDOUT_FILENO, numError, strlen(numError));
+            return -1;
+        }
+    } else { // Determine the largest job ID
+        jobID = -1;
+        for(int i=0; i<256; i++) {
+        	if(!allJobs[i].isValid && allJobs[i].id > jobID && !allJobs[i].isFG) {
+                jobID = allJobs[i].id;
+            }
+        }
+        if (jobID == -1) {
+            char noJobsError[256] = "No jobs available in bg\n";
+            write(STDOUT_FILENO, noJobsError, strlen(noJobsError));
+            return -1;
+        }
+    }
+
+    // Find the job with the specified ID
+    int found = 0;
+    for (int i = 0; i < 256; i++) {
+        if (!allJobs[i].isValid && !allJobs[i].isFG && allJobs[i].id == jobID) {
+            // Put the job in the foreground
+            putInFG(allJobs[i], 0);
+            foregroundJob = allJobs[i];
+            found = 1;
+            break;
+        }
+    }
+
+    if (!found) {
+        char notFoundMsg[256];
+        sprintf(notFoundMsg, "No background job found with ID %d\n", jobID);
+        write(STDOUT_FILENO, notFoundMsg, strlen(notFoundMsg));
+        return -1;
+    }
+
+    return 1;
+
+
 }
 
 
@@ -379,10 +544,10 @@ int builtInCommands(char **args, int wshc) {
     if(jobs(args, wshc)) return 1;
 
     // fg //
-    if(fg()) return 1;
+    if(fg(args, wshc)) return 1;
 
     // bg //
-    if(bg()) return 1;
+    if(bg(args, wshc)) return 1;
 
     return 0;
 }
