@@ -35,6 +35,12 @@ pid_t shellPGID;
 struct termios shellTmodes;
 int shellTerminal;
 int isShellInteractive;
+volatile sig_atomic_t sigChildFlag = 0;
+
+
+void sigchild_handler(int sigchild) {
+    sigChildFlag = 1;
+}
 
 
 // add job to array - ID, isDone, isFG, programName, args, numArgs, & wasInitB
@@ -45,7 +51,7 @@ Job addJob(char **args, pid_t pid) {
     newJob.numArgs = 0;
     newJob.programName = args[0];
     newJob.pid = pid;
-	
+
     for(int j = 0; j < 256; j++) { // find ID
 	if(allJobs[j].isValid == 1) {
 	    newJob.isValid = 0;
@@ -60,6 +66,8 @@ Job addJob(char **args, pid_t pid) {
 	if(strcmp(args[i], "&") == 0) {
 	    newJob.wasInitBG = 1;
 	    newJob.isFG = 0;
+	    // remove from list lol
+	    allJobs[newJob.id - 1].isValid = 1;
 	    break; // means we're at the end of args
 	}
 	    
@@ -68,7 +76,7 @@ Job addJob(char **args, pid_t pid) {
         i++;
      }
      
-     if(!newJob.wasInitBG) {
+     if(!newJob.wasInitBG) { // forground process
          newJob.isFG = 1;
     	 foregroundJob = newJob;
      }
@@ -129,7 +137,7 @@ void launchJob(Job job, pid_t pgid, char **args, int fg, int wshc, char path[]) 
     if(isShellInteractive) {
         // put process into process group and give process group terminal if needed
         pid = getpid();
-        if(pid == 0) {
+        if(pgid == 0) {
             pgid = pid;
             job.pgid = pgid;
         }
@@ -137,28 +145,62 @@ void launchJob(Job job, pid_t pgid, char **args, int fg, int wshc, char path[]) 
         setpgid(pid, pgid);
         
         // if job is foreground
-        if(fg) {
+        if(fg) { // sending currjob to current terminal if in fg
             tcsetpgrp(shellTerminal, pgid);
-        } 
-        
-        if (strcmp(args[wshc - 1], "&") == 0) {
-	    args[wshc - 1] = NULL;
-	}
+            job.isFG = 1;
+        }
         
         // Set the handling for job control signals back to the default
         signal (SIGINT,  SIG_DFL);
         signal (SIGQUIT, SIG_DFL);
         signal (SIGTSTP, SIG_DFL);
         signal (SIGTTIN, SIG_DFL);
-        signal (SIGTTOU, SIG_DFL);
+        // signal (SIGTTOU, SIG_DFL);
         signal (SIGCHLD, SIG_DFL);
+    }
         
-        execvp(path, args);
+    execvp(path, args);
         
-        // if succeeds, should not reach here !!
-        char execFailed[256] = "Exec failed\n";
-        write(STDOUT_FILENO, execFailed, strlen(execFailed));
-        exit(-1);
+    // if succeeds, should not reach here !!
+    char execFailed[256] = "Exec failed\n";
+    write(STDOUT_FILENO, execFailed, strlen(execFailed));
+    exit(-1);
+}
+
+
+/** Put job in the foreground.  If cont is nonzero,
+  * restore the saved terminal modes and send the process group a
+  * SIGCONT signal to wake it up before we block.  
+*/
+void putInFG(Job job, int cont) {
+    // Put the job into the foreground
+    tcsetpgrp (shellTerminal, job.pgid);
+
+    // Send the job a continue signal, if necessary
+    if (cont) {
+      // tcsetattr (shellTerminal, TCSADRAIN, &ob->tmodes);
+      if (kill (- job.pgid, SIGCONT) < 0) {
+          char killFailed[256] = "kill SIGCONT error(FG)\n";
+    	  write(STDOUT_FILENO, killFailed, strlen(killFailed));
+      }
+    }
+    
+    int status;
+    waitpid(job.pid, &status, WUNTRACED);
+    
+    tcsetpgrp(shellTerminal, shellPGID);
+}
+
+/* Put a job in the background.  If the cont argument is true, send
+ * the process group a SIGCONT signal to wake it up.  
+ */
+void putInBG(Job job, int cont) {
+    // send the job a continue signal if necessary
+    if(cont) {
+        if(kill (-job.pgid, SIGCONT) < 0) {
+            char killFailed[256] = "kill SIGCONT error (BG)\n";
+    	    write(STDOUT_FILENO, killFailed, strlen(killFailed));
+        }
     }
 }
 
@@ -171,6 +213,7 @@ void paths(char **args, int wshc) {
     strcat(pathUsr, args[0]);
     strcat(path, args[0]);
     args[wshc] = NULL; // null terminate args
+    
     if(access(pathUsr, X_OK) != 0) { // /usr/bin/command not executable
         if (access(path, X_OK) != 0) { // /bin/command not executable
             char notExecutable[256] = "Command is not executable\n";
@@ -183,20 +226,20 @@ void paths(char **args, int wshc) {
         strcpy(absolutePath, pathUsr);
     }
     
+    int fg = 1; // default to foreground
     // check if initialized to background
-    int fg = 1;
-    if(strcmp(args[wshc - 1], "&") == 0) {
+    if( wshc > 0 && strcmp(args[wshc - 1], "&") == 0) {
         fg = 0;
+        args[wshc - 1] = NULL;
     }
     
     pid_t pid = fork();
     struct Job job; 
-    if(!fg) {
-        job = addJob(args, pid);
-    }
+    job = addJob(args, pid);
     
     // fork exec !!! -- reference from discussion code
-    if (pid == 0) { // child process !!  
+    if (pid == 0) { // child process !! 
+    	job.pid = getpid();
  	pid_t pgid = 0;
  	
         launchJob(job, pgid, args, fg, wshc, absolutePath);
@@ -207,10 +250,28 @@ void paths(char **args, int wshc) {
                 job.pgid = pid;
             }
             setpgid(pid, job.pgid);
+            
+            if(fg) { // job in foreground
+                putInFG(job, 0);
+            } else {
+                // wait pid for sigchild -- different waitpid
+                // remove job from job list & autoremoves from ps
+        	signal(SIGCHLD, sigchild_handler);
+                putInBG(job, 0);
+                
+                    int status;
+    		// block until background process is done
+	        pid_t bgPID = waitpid(pid, &status, WUNTRACED|WNOHANG);
+	        if(bgPID == -1) {
+		    char waitPIDErr[256] = "SIGCHLD waitpid error\n";
+		    write(STDOUT_FILENO, waitPIDErr, strlen(waitPIDErr));
+		    exit(-1);
+	        }
+            }
+        } // end of if(isShellInteractive) 
+        if(sigChildFlag) { // get rid of inactive background job
+        
         }
-		
-        int status;
-        waitpid(pid, &status, 0); // wait for child process to finish
     }
 }
 
@@ -234,12 +295,15 @@ int bg() {
  * returns 1 if command completed, 0 otherwise
  */
 int fg() {
+
+    
     return 0;
 }
 
 
 /**
  * checks built in command jobs
+ * format: `<id>: <program name> <arg1> <arg2> … <argN> [&]`
  *
  * returns 1 if command completed, 0 otherwise
  */
@@ -253,7 +317,8 @@ int jobs(char **args, int wshc) {
         // TODO: account for piping when implemented
         // iterate through jobs & print out background jobs
         for(int i = 0; i < sizeof(allJobs) / sizeof(allJobs[0]); i++) {
-            if(!(allJobs[i].isFG)) { // format: `<id>: <program name> <arg1> <arg2> … <argN> [&]`
+            if(!allJobs[i].isValid && !allJobs[i].isFG) {
+            
                 char formatted[256];
                 sprintf(formatted, "%d: ", allJobs[i].id);
                 strcat(formatted, allJobs[i].programName);
@@ -261,16 +326,17 @@ int jobs(char **args, int wshc) {
                 // print out all args
                 for(int j = 0; j < 256; j++) { // TODO: better conditional :)
                     char arg[256] = " ";
-                    strcat(arg, allJobs[i].args[j]);
+                    strcat(arg, allJobs[i].args[j]); // SEG FAULT !!
                     write(STDOUT_FILENO, arg, strlen(arg));
                 }
                 if(allJobs[i].wasInitBG) { // if job was initiated as background
                     char initBG[256] = " &";
                     write(STDOUT_FILENO, initBG, strlen(initBG));
                 }
-            } // else the job is in the foreground !
-            char *newLine = "\n";
-            write(STDOUT_FILENO, newLine, strlen(newLine));
+            
+                char *newLine = "\n";
+                write(STDOUT_FILENO, newLine, strlen(newLine));
+            }
         }
         return 1;
     }
