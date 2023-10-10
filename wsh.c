@@ -5,6 +5,7 @@
 #include <sys/wait.h>
 #include <sys/types.h>
 #include <termios.h>
+#include <fcntl.h>
 
 
 // job code / logic from GNU C Library //
@@ -44,7 +45,7 @@ void sigchild_handler(int sigchild) {
 
 
 // add job to array - ID, isDone, isFG, programName, args, numArgs, & wasInitB
-Job addJob(char **args, pid_t pid) {
+Job addJob(char **args, int wshc, pid_t pid) {
     struct Job newJob;
     newJob.isDone = 0;
     newJob.wasInitBG = 0;
@@ -52,33 +53,30 @@ Job addJob(char **args, pid_t pid) {
     newJob.programName = args[0];
     newJob.pid = pid;
 
-    for(int j = 0; j < 256; j++) { // find ID
-	if(allJobs[j].isValid == 1) {
-	    newJob.isValid = 0;
-   	    allJobs[j] = newJob;
-	    newJob.id = j + 1; // ID has to be positive
-	    break;
-	}
-    }
-
     int i = 1;
-    while(args[i] != NULL) { // get wasInitBG, args, & numArgs
-	if(strcmp(args[i], "&") == 0) {
-	    newJob.wasInitBG = 1;
-	    newJob.isFG = 0;
-	    // remove from list lol
-	    allJobs[newJob.id - 1].isValid = 1;
-	    break; // means we're at the end of args
-	}
-	    
-	newJob.args[newJob.numArgs] = args[i];
+    while(args[i] != NULL) { // get args & numArgs
+ 	newJob.args[newJob.numArgs] = args[i];
         newJob.numArgs++;    
         i++;
+     }
+     
+     if(strcmp(args[wshc - 1], "&") == 0) { // wasInitGB & isFG
+          newJob.wasInitBG = 1;
+	  newJob.isFG = 0;
      }
      
      if(!newJob.wasInitBG) { // forground process
          newJob.isFG = 1;
     	 foregroundJob = newJob;
+     } else {
+         for(int j = 0; j < 256; j++) { // find ID
+	     if(allJobs[j].isValid == 1) {
+	         newJob.isValid = 0;
+	         newJob.id = 1 + j; // ID has to be positive
+   	         allJobs[j] = newJob;
+	         break;
+	    }
+        }
      }
      
      return newJob;
@@ -206,7 +204,7 @@ void putInBG(Job job, int cont) {
 
 
 // implement commands specified by paths
-void paths(char **args, int wshc) {
+int paths(char **args, int wshc) {
     char pathUsr[256] = "/usr/bin/";
     char path[256] = "/bin/";
     char absolutePath[256] = "";
@@ -218,7 +216,7 @@ void paths(char **args, int wshc) {
         if (access(path, X_OK) != 0) { // /bin/command not executable
             char notExecutable[256] = "Command is not executable\n";
             write(STDOUT_FILENO, notExecutable, strlen(notExecutable));
-            exit(-1);
+            return -1;
         } else { // reset path to /bin/command
             strcpy(absolutePath, path);
         }
@@ -226,16 +224,16 @@ void paths(char **args, int wshc) {
         strcpy(absolutePath, pathUsr);
     }
     
+    pid_t pid = fork();
+    struct Job job; 
+    job = addJob(args, wshc, pid);
+    
     int fg = 1; // default to foreground
     // check if initialized to background
-    if( wshc > 0 && strcmp(args[wshc - 1], "&") == 0) {
+    if(wshc > 0 && job.wasInitBG) {
         fg = 0;
         args[wshc - 1] = NULL;
     }
-    
-    pid_t pid = fork();
-    struct Job job; 
-    job = addJob(args, pid);
     
     // fork exec !!! -- reference from discussion code
     if (pid == 0) { // child process !! 
@@ -259,9 +257,9 @@ void paths(char **args, int wshc) {
         	signal(SIGCHLD, sigchild_handler);
                 putInBG(job, 0);
                 
-                    int status;
+                int status;
     		// block until background process is done
-	        pid_t bgPID = waitpid(pid, &status, WUNTRACED|WNOHANG);
+	        pid_t bgPID = waitpid(pid, &status, WUNTRACED|WNOHANG); // TODO: move this, won't work in every case
 	        if(bgPID == -1) {
 		    char waitPIDErr[256] = "SIGCHLD waitpid error\n";
 		    write(STDOUT_FILENO, waitPIDErr, strlen(waitPIDErr));
@@ -270,9 +268,14 @@ void paths(char **args, int wshc) {
             }
         } // end of if(isShellInteractive) 
         if(sigChildFlag) { // get rid of inactive background job
-        
+            for (int j = 0; j < 256; j++) {
+                if (!allJobs[j].isFG && !allJobs[j].isValid) {
+                    allJobs[j].isValid = 1;
+                }
+            }
         }
     }
+    return 0;
 }
 
 
@@ -316,26 +319,19 @@ int jobs(char **args, int wshc) {
         }
         // TODO: account for piping when implemented
         // iterate through jobs & print out background jobs
-        for(int i = 0; i < sizeof(allJobs) / sizeof(allJobs[0]); i++) {
+        for(int i = 0; i < 256; i++) {
             if(!allJobs[i].isValid && !allJobs[i].isFG) {
             
                 char formatted[256];
-                sprintf(formatted, "%d: ", allJobs[i].id);
-                strcat(formatted, allJobs[i].programName);
-                write(STDOUT_FILENO, formatted, strlen(formatted));
+                sprintf(formatted, "%d: %s", allJobs[i].id, allJobs[i].programName);
                 // print out all args
-                for(int j = 0; j < 256; j++) { // TODO: better conditional :)
-                    char arg[256] = " ";
-                    strcat(arg, allJobs[i].args[j]); // SEG FAULT !!
-                    write(STDOUT_FILENO, arg, strlen(arg));
-                }
-                if(allJobs[i].wasInitBG) { // if job was initiated as background
-                    char initBG[256] = " &";
-                    write(STDOUT_FILENO, initBG, strlen(initBG));
-                }
+                for(int j = 0; j < allJobs[i].numArgs; j++) {
+                    strcat(formatted, " ");
+                    strcat(formatted, allJobs[i].args[j]);
+                } 
             
-                char *newLine = "\n";
-                write(STDOUT_FILENO, newLine, strlen(newLine));
+                strcat(formatted, "\n");
+                write(STDOUT_FILENO, formatted, strlen(formatted));
             }
         }
         return 1;
@@ -434,6 +430,8 @@ int main(int argc, char *argv[]) {
             char lineReadError[256] = "Unable to read user input\n";
             write(STDOUT_FILENO, lineReadError, strlen(lineReadError));
             exit(-1);
+        } else if (userIn[0] == '\0') {
+            continue;
         }
 
         // get number of arguments -- chatgpt for help with logic of string of strings
