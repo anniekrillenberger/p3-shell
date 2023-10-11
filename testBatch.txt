@@ -1,0 +1,6 @@
+echo hello
+ls
+cd ..
+ls
+sleep 4
+

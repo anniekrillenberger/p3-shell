@@ -538,7 +538,8 @@ int builtInCommands(char **args, int wshc) {
 
 int main(int argc, char *argv[]) {
     char *userIn;
-    int isBatch = 0;
+    FILE *fileIn;
+    int isInteractive = 0;
     
     shellInit();
     
@@ -547,10 +548,14 @@ int main(int argc, char *argv[]) {
 
     // check if interactive mode or batch mode
     if (argc == 1) { // interactive mode
-        // do nothing for now
+        isInteractive = 1;
     } else if (argc == 2) { // batch mode  -- format to call should be ./wsh scriptName
-        // isBatch = 1;
-        // open file n shit
+        fileIn = fopen(argv[1], "r");
+        if(fileIn == NULL) {
+            char fnf[256] = "File not found\n";
+            write(STDOUT_FILENO, fnf, strlen(fnf));
+            exit(-1);
+        }
     } else { // invalid input
         char invalidIn[256] = "Invalid input\n";
         write(STDOUT_FILENO, invalidIn, strlen(invalidIn));
@@ -560,16 +565,21 @@ int main(int argc, char *argv[]) {
     while (1) { // repeatedly asks for input
 
         // print prompt if in interactive mode
-        if (!isBatch) {
+        if (isInteractive) {
             char prompt[256] = "wsh> ";
             write(STDOUT_FILENO, prompt, strlen(prompt));
-        }
+        } 
 
         // get user input
         size_t len = 0;
-        ssize_t getLine = getline(&userIn, &len, stdin);
-        // null terminate to get rid of new line char
-        userIn[getLine - 1] = '\0';
+        ssize_t getLine;
+        if(isInteractive) { // interactive mode
+            getLine = getline(&userIn, &len, stdin);
+            // null terminate to get rid of new line char
+            userIn[getLine - 1] = '\0';
+        } else { // batch mode
+            getLine = getline(&userIn, &len, fileIn);
+        }
 
         // if user types ctrl-d, exit
         if (feof(stdin)) {
