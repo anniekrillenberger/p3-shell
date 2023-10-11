@@ -381,10 +381,6 @@ int bg(char **args, int wshc) {
             // Update job status
             allJobs[i].isDone = 0;
 
-            char resumeMsg[256];
-            sprintf(resumeMsg, "Resumed background job with ID %d\n", jobID);
-            write(STDOUT_FILENO, resumeMsg, strlen(resumeMsg));
-
             found = 1;
             break;
         }
