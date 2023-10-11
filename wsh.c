@@ -432,8 +432,6 @@ int fg(char **args, int wshc) {
             write(STDOUT_FILENO, noJobsError, strlen(noJobsError));
             return -1;
         }
-
-
     }
 
     // find job associated with id
@@ -441,6 +439,7 @@ int fg(char **args, int wshc) {
         if (!allJobs[i].isValid && allJobs[i].id == jobID) {
             allJobs[i].isFG = 1;
             foregroundJob = allJobs[i];
+            allJobs[i].isValid = 1;
             putInFG(allJobs[i], 1);
         }
     }
