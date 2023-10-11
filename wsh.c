@@ -7,6 +7,7 @@
 #include <termios.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <fcntl.h>
 
 // job code / logic from GNU C Library //
 
@@ -23,12 +24,6 @@ typedef struct Job {
     pid_t pgid;		// 
 } Job;
 
-// pipeline of processes
-typedef struct JobGroup {
-    pid_t pgid;			    // job group ID
-    struct termios tmodes;	// saved terminal modes
-} JobGroup;
-
 // GLOBAL VARIABLES //
 struct Job allJobs[256]; // array of background & stopped jobs 
 Job foregroundJob;
@@ -38,6 +33,8 @@ int shellTerminal;
 int isShellInteractive;
 volatile sig_atomic_t sigChildFlag = 0;
 volatile sig_atomic_t sigStopFlag = 0;
+int pipeFile;
+int isPipe;
 
 
 // Handle SIGCHLD (child process dies)
@@ -115,7 +112,6 @@ void launchJob(Job job, pid_t pgid, char **args, int fg, int wshc, char path[]) 
         signal (SIGQUIT, SIG_DFL);
         signal (SIGTSTP, SIG_DFL);
         signal (SIGTTIN, SIG_DFL);
-        // signal (SIGTTOU, SIG_DFL); -- SHOULD NOT MAKE PROBLEM
         signal (SIGCHLD, SIG_DFL);
         signal (SIGCONT, SIG_DFL);
     }
@@ -166,7 +162,6 @@ void putInFG(Job job, int cont) {
 
     // Send the job a continue signal, if necessary
     if (cont) {
-      // tcsetattr (shellTerminal, TCSADRAIN, &ob->tmodes);
       if (kill (- job.pgid, SIGCONT) < 0) {
           char killFailed[256] = "kill SIGCONT error(FG)\n";
     	  write(STDOUT_FILENO, killFailed, strlen(killFailed));
@@ -250,24 +245,35 @@ void shellInit() {
 
 // implement commands specified by paths
 int paths(char **args, int wshc) {
+
     char pathUsr[256] = "/usr/bin/";
     char path[256] = "/bin/";
     char absolutePath[256] = "";
+    args[wshc] = NULL; // null terminate args
+
+    if(isPipe) { // piping -- deal w file
+        // If it's part of a pipe and output redirection is needed, open the output file
+        pipeFile = open("pipe1.txt", O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
+
+        if (pipeFile == -1) {
+            char failedToOpen[256] = "Failed to open output file\n";
+            write(STDOUT_FILENO, failedToOpen, strlen(failedToOpen));
+            return -1;
+        }
+    } 
+
     strcat(pathUsr, args[0]);
     strcat(path, args[0]);
-    args[wshc] = NULL; // null terminate args
     
     if(access(pathUsr, X_OK) != 0) { // /usr/bin/command not executable
         if (access(path, X_OK) != 0) { // /bin/command not executable
             char notExecutable[256] = "Command is not executable\n";
             write(STDOUT_FILENO, notExecutable, strlen(notExecutable));
             return -1;
-        } else { // reset path to /bin/command
+        } else // reset path to /bin/command
             strcpy(absolutePath, path);
-        }
-    } else { // reset path to /usr/bin/command
+    } else // reset path to /usr/bin/command
         strcpy(absolutePath, pathUsr);
-    }
     
     pid_t pid = fork();
     struct Job job; 
@@ -284,10 +290,16 @@ int paths(char **args, int wshc) {
     if (pid == 0) { // child process !! 
        	job.pid = getpid();
  	    pid_t pgid = 0;
+
+        if(isPipe) {
+            // Redirect stdout to the file
+            dup2(pipeFile, STDOUT_FILENO);
+
+        }
  	
         launchJob(job, pgid, args, fg, wshc, absolutePath);
         
-    } else { // parent process !!
+    } else if (pid > 0) { // parent process !!
         if(isShellInteractive) {
             if(!job.pgid) {
                 job.pgid = pid;
@@ -304,7 +316,12 @@ int paths(char **args, int wshc) {
             }
         } // end of if(isShellInteractive) 
         
+    } else { // fork failed
+        char forkFail[256] = "Fork Failed\n";
+        write(STDOUT_FILENO, forkFail, strlen(forkFail));
+        return -1;
     }
+
     // remove job from job list & autoremoves from ps
     if(sigChildFlag) { // get rid of inactive background job
         for (int j = 0; j < 256; j++) {
@@ -579,6 +596,7 @@ int main(int argc, char *argv[]) {
             userIn[getLine - 1] = '\0';
         } else { // batch mode
             getLine = getline(&userIn, &len, fileIn);
+            userIn[getLine - 1] = '\0';
         }
 
         // if user types ctrl-d, exit
@@ -592,22 +610,79 @@ int main(int argc, char *argv[]) {
             continue;
         }
 
+        // piping
+        isPipe = 0;
+        int pipeIndex = -1;
+
         // get number of arguments -- chatgpt for help with logic of string of strings
         char *args[256];
         char *seperate;
         int wshc = 0;
         while ((seperate = strsep(&userIn, " ")) != NULL) {
             if (strlen(seperate) > 0) {
+                if(strcmp(seperate, "|") == 0) { // it is a pipe
+                    isPipe = 1;
+                    pipeIndex = wshc;
+                }
                 args[wshc] = strdup(seperate);
                 wshc++;
             }
         }
 
-        // built in commands: exit, cd, jobs, fg, & bg
-        if (builtInCommands(args, wshc)) continue;
+        if(!isPipe) { // (assumming there is only |)
 
-        // paths
-        paths(args, wshc);
+            // built in commands: exit, cd, jobs, fg, & bg
+            if (builtInCommands(args, wshc)) continue;
+
+            // paths
+            paths(args, wshc);
+
+        } else { // piping
+            char *pipe1[256];
+            char *pipe2[256];
+            int wshcPipe1 = 0;
+            int wshcPipe2 = 0;
+
+            for (int i = 0; i < pipeIndex; i++) {
+                if (args[i] != NULL) {
+                    pipe1[i] = strdup(args[i]);  // Copy each element
+                    wshcPipe1++;
+                } else {
+                    pipe1[i] = NULL;  // Set the corresponding element in pipe1 to NULL
+                }
+            }
+
+            paths(pipe1, wshcPipe1);
+            close(pipeFile);
+
+            // get second command
+            for(int j = pipeIndex + 1; j < wshc; j++) {
+                if (args[j] != NULL) {
+                    pipe2[wshcPipe2] = strdup(args[j]);  // Copy each element
+                    wshcPipe2++;
+                } else {
+                    pipe2[j] = NULL;  // Set the corresponding element in pipe1 to NULL
+                }
+            }
+
+            // add output from command one to command 2
+            FILE *file;
+            isPipe = 0;
+            // char pipeArgs[256];
+            // int pipeArgCnt = 0;
+
+            file = fopen("pipe1.txt", "r");
+            if (file == NULL) {
+                char failedToOpen[256] = "Failed to open input file\n";
+                write(STDOUT_FILENO, failedToOpen, strlen(failedToOpen));
+                return -1;
+            }
+
+            pipe2[wshcPipe2] = strdup("pipe1.txt");
+
+            paths(pipe2, wshc - pipeIndex);
+            fclose(file);
+        }
 
     } // end of while loop
 
