@@ -37,6 +37,7 @@ struct termios shellTmodes;
 int shellTerminal;
 int isShellInteractive;
 volatile sig_atomic_t sigChildFlag = 0;
+volatile sig_atomic_t sigStopFlag = 0;
 
 
 // Handle SIGCHLD (child process dies)
@@ -46,6 +47,7 @@ void sigchild_handler(int sigchild) {
     int status;
     // block until background process is done
     waitpid(WAIT_ANY, &status, WUNTRACED|WNOHANG); // PUT IN WHILE LOOP !!
+
 } // gets called for any changed -- use status to find out!!
 
 
@@ -104,8 +106,8 @@ void launchJob(Job job, pid_t pgid, char **args, int fg, int wshc, char path[]) 
         
         // if job is foreground
         if(fg) { // sending currjob to current terminal if in fg
-            tcsetpgrp(shellTerminal, pgid);
             job.isFG = 1;
+            tcsetpgrp(shellTerminal, pgid);
         }
         
         // Set the handling for job control signals back to the default
@@ -131,6 +133,7 @@ void launchJob(Job job, pid_t pgid, char **args, int fg, int wshc, char path[]) 
  * the process group a SIGCONT signal to wake it up.  
  */
 void putInBG(Job job, int cont) {
+
     // send the job a continue signal if necessary
     if(cont) {
         if(kill (-job.pgid, SIGCONT) < 0) {
@@ -151,27 +154,13 @@ void putInBG(Job job, int cont) {
 }
 
 
-// Handle SIGTSTP (Ctrl-Z)
-void sigtstp_handler(int signo) { // dont need to handle !! ignore in shell, child set to default
-// update job in sigchild -- call waitpid in while loop
-    // suspends foreground job & put job in BG
-    putInBG(foregroundJob, 0); // DEFINIETELY SHOULD NOT BE DOING THIS
-    // make fg job available to be open again
-    foregroundJob.isValid = 1;
-    // set back to default
-    signal(SIGTSTP, SIG_DFL);
-    kill (- foregroundJob.pid, SIGTSTP);
-    printf("SIGSTP\n");
-    // NOT CALLED WHEN CTRL-Z
-}
-
-
 /** Put job in the foreground.  If cont is nonzero,
   * restore the saved terminal modes and send the process group a
   * SIGCONT signal to wake it up before we block.  
 */
 void putInFG(Job job, int cont) {
     foregroundJob = job;
+
     // Put the job into the foreground
     tcsetpgrp (shellTerminal, job.pgid);
 
@@ -185,24 +174,29 @@ void putInFG(Job job, int cont) {
     }
 
     int status;
-    waitpid(job.pid, &status, WUNTRACED);
-
-    // 
-
-    // Restore signal handling -- DONT DO THIS, NOTHING TO DO W CHILD
-    // signal(SIGTSTP, sigtstp_handler);
+    waitpid(foregroundJob.pid, &status, WUNTRACED);
 
     // Check if the job was stopped by SIGTSTP
-    if (WIFSTOPPED(status)) {
-        printf("Job [%d] stopped by signal SIGTSTP\n", job.id);
-        // PUT IN JOB LIST !! GET RID OF SIGTSTOP Handler 
+    if (WIFSTOPPED(status) && job.isFG) {
+        // printf("Job [%d] stopped by signal SIGTSTP\n", job.id);
+        // ADD JOB TO JOB LIST -- help from Omid
+        foregroundJob.isValid = 1;
+        job.isFG = 0;
+        for(int j = 0; j < 256; j++) { // find ID
+            if(allJobs[j].isValid == 1) {
+                job.isValid = 0;
+                job.id = 1 + j; // ID has to be positive
+                allJobs[j] = job;
+                break;
+            }
+        }
     }
 
-    // clear fg
-    // check status of fg -- compare against WIFSTOPPED (ish) 
+    // Clear the foreground job
+    foregroundJob.isValid = 1;
     
-    tcsetpgrp(shellTerminal, shellPGID); // CORRECT 
-    // IF TERMINATED LET GO !! DONT NEED ! DONT NEED TO DO
+    // return control to the shell
+    tcsetpgrp(shellTerminal, shellPGID); // CORRECT -- confirmed by Omid
 }
 
 
@@ -228,7 +222,7 @@ void shellInit() {
         // Ignore interactive and job-control signals
     	signal (SIGINT,  SIG_IGN);
         signal (SIGQUIT, SIG_IGN);
-        signal (SIGTSTP, sigtstp_handler);
+        signal (SIGTSTP, SIG_IGN);
         signal (SIGTTIN, SIG_IGN);
         signal (SIGTTOU, SIG_IGN);
         signal (SIGCHLD, SIG_IGN);
@@ -288,7 +282,7 @@ int paths(char **args, int wshc) {
     
     // fork exec !!! -- reference from discussion code
     if (pid == 0) { // child process !! 
-    	job.pid = getpid();
+       	job.pid = getpid();
  	    pid_t pgid = 0;
  	
         launchJob(job, pgid, args, fg, wshc, absolutePath);
@@ -310,21 +304,21 @@ int paths(char **args, int wshc) {
             }
         } // end of if(isShellInteractive) 
         
-        // remove job from job list & autoremoves from ps
-        if(sigChildFlag) { // get rid of inactive background job
-            for (int j = 0; j < 256; j++) {
-                if (!allJobs[j].isFG && !allJobs[j].isValid) {
-                    // Send SIGCONT to the process group associated with the job
-                    if (kill(-allJobs[j].pgid, SIGCONT) < 0) {
-                        char kill[256] = "kill (removing job)\n";
-                        write(STDOUT_FILENO, kill, strlen(kill));
-                        return -1;
-                    }
-
-                    // Clear the job entry
-                    allJobs[j].isValid = 1;
-                    allJobs[j].id = 0;
+    }
+    // remove job from job list & autoremoves from ps
+    if(sigChildFlag) { // get rid of inactive background job
+        for (int j = 0; j < 256; j++) {
+            if (!allJobs[j].isFG && !allJobs[j].isValid) {
+                // Send SIGCONT to the process group associated with the job
+                if (kill(-allJobs[j].pgid, SIGCONT) < 0) {
+                    char kill[256] = "kill (removing job)\n";
+                    write(STDOUT_FILENO, kill, strlen(kill));
+                    return -1;
                 }
+
+                // Clear the job entry
+                allJobs[j].isValid = 1;
+                allJobs[j].id = 0;
             }
         }
     }
@@ -442,30 +436,24 @@ int fg(char **args, int wshc) {
             write(STDOUT_FILENO, noJobsError, strlen(noJobsError));
             return -1;
         }
+
+
     }
 
-    // Find the job with the specified ID
-    int found = 0;
-    for (int i = 0; i < 256; i++) {
-        if (!allJobs[i].isValid && !allJobs[i].isFG && allJobs[i].id == jobID) {
-            // Put the job in the foreground
-            putInFG(allJobs[i], 0);
+    // find job associated with id
+    for(int i = 0; i < 256; i++) {
+        if (!allJobs[i].isValid && allJobs[i].id == jobID) {
+            allJobs[i].isFG = 1;
             foregroundJob = allJobs[i];
-            found = 1;
-            break;
+            putInFG(allJobs[i], 1);
         }
     }
-
-    if (!found) {
-        char notFoundMsg[256];
-        sprintf(notFoundMsg, "No background job found with ID %d\n", jobID);
-        write(STDOUT_FILENO, notFoundMsg, strlen(notFoundMsg));
+     if (jobID == -1) {
+        char invalidID[256] = "Invalid ID\n";
+        write(STDOUT_FILENO, invalidID, strlen(invalidID));
         return -1;
     }
-
     return 1;
-
-
 }
 
 
